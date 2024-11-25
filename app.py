@@ -1,18 +1,18 @@
 import streamlit as st
-from transformers import AutoTokenizer, AutoModelForSeq2SeqLM, pipeline
+from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
+from transformers import pipeline
 import torch
-from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_community.vectorstores import Chroma
 from langchain_community.llms import HuggingFacePipeline
 from langchain.chains import RetrievalQA
 from langchain_community.document_loaders import PyPDFLoader
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+import tempfile
 import os
-from chromadb.config import Settings
-from chromadb import Client
 
-# Use a publicly available model
-checkpoint = "t5-small"  # Change to a valid model identifier
+# Use a better model for improved responses
+checkpoint = "google/flan-t5-base"  # Changed from t5-small for better quality
 tokenizer = AutoTokenizer.from_pretrained(checkpoint)
 base_model = AutoModelForSeq2SeqLM.from_pretrained(
     checkpoint, 
@@ -26,75 +26,115 @@ def llm_pipeline():
         'text2text-generation',
         model=base_model,
         tokenizer=tokenizer,
-        max_length=256,
-        do_sample=False,  # Ensure deterministic outputs
-        temperature=0.0
+        max_length=512,  # Increased for more detailed responses
+        do_sample=True,
+        temperature=0.7,  # Adjusted for better creativity
+        top_p=0.95,
+        repetition_penalty=1.2  # Added to prevent repetition
     )
     local_llm = HuggingFacePipeline(pipeline=pipe)
     return local_llm
 
-def process_pdf(uploaded_file):
-    # Save the uploaded file locally
-    with open("temp_uploaded_file.pdf", "wb") as f:
-        f.write(uploaded_file.read())
-    
-    # Use the local file path with PyPDFLoader
-    loader = PyPDFLoader("temp_uploaded_file.pdf")
+def process_pdf(pdf_file):
+    with tempfile.NamedTemporaryFile(delete=False, suffix='.pdf') as tmp_file:
+        tmp_file.write(pdf_file.getvalue())
+        tmp_path = tmp_file.name
+
+    loader = PyPDFLoader(tmp_path)
     documents = loader.load()
-    text_splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=50)
+    
+    text_splitter = RecursiveCharacterTextSplitter(
+        chunk_size=1500,  # Increased chunk size for better context
+        chunk_overlap=150,
+        length_function=len
+    )
     texts = text_splitter.split_documents(documents)
     
-    # Create an in-memory Chroma instance
-    settings = Settings(
-        chroma_db_impl="duckdb+parquet",  # Default in-memory configuration
-        anonymized_telemetry=False
-    )
-    client = Client(Settings(
-        chroma_db_impl="duckdb+parquet",  # Use DuckDB with Parquet files
-        persist_directory="./db"         # Directory for persistent storage
-    ))
-    print("Chroma initialized successfully!")
-    
-    # Generate embeddings
     embeddings = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
-    db = Chroma.from_documents(
-        texts,
-        embedding_function=embeddings,
-        client=client  # Pass the initialized client
-    )
-    retriever = db.as_retriever()
-
-    # Clean up the temporary file
-    os.remove("temp_uploaded_file.pdf")
+    db = Chroma.from_documents(texts, embeddings, persist_directory="db")
+    db.persist()
     
-    return retriever
+    os.unlink(tmp_path)
+    return db
 
-
-def process_answer(retriever, instruction):
+def qa_llm():
     llm = llm_pipeline()
+    embeddings = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
+    db = Chroma(persist_directory="db", embedding_function=embeddings)
+    retriever = db.as_retriever(
+        search_kwargs={"k": 3}  # Limit to top 3 most relevant chunks
+    )
     qa = RetrievalQA.from_chain_type(
-        llm=llm, chain_type="stuff", retriever=retriever, return_source_documents=False)
-    generated_text = qa(instruction)
-    return generated_text['result']
+        llm=llm,
+        chain_type="stuff",
+        retriever=retriever,
+        return_source_documents=True
+    )
+    return qa
+
+def clean_answer(text):
+    # Remove repetitive phrases and clean up the response
+    if "Helpful Answer:" in text:
+        text = text.split("Helpful Answer:")[-1].strip()
+    return text.strip()
+
+def process_answer(instruction):
+    qa = qa_llm()
+    # Enhance the prompt to get better responses
+    enhanced_prompt = f"Based on the context, provide a clear and concise answer to: {instruction}"
+    generated_text = qa(enhanced_prompt)
+    answer = clean_answer(generated_text['result'])
+    return answer, generated_text
 
 def main():
-    st.title("Dynamic PDF Q&A 🐦📄")
-    with st.expander("About the App"):
-        st.markdown(
-            """
-            This is a Generative AI-powered Question and Answering app that responds to questions about any uploaded PDF file.
-            """
-        )
-    uploaded_file = st.file_uploader("Upload your PDF", type="pdf")
-    if uploaded_file:
-        retriever = process_pdf(uploaded_file)
-        st.success("PDF file processed successfully!")
-        question = st.text_area("Enter your Question")
-        if st.button("Ask"):
-            st.info("Your Question: " + question)
-            answer = process_answer(retriever, question)
-            st.info("Your Answer")
-            st.write(answer)
+    st.title("📚 PDF Question Answering System")
+    
+    with st.expander("ℹ️ About the App"):
+        st.markdown("""
+            This is a Generative AI powered Question and Answering app that responds to questions about your PDF File.
+            
+            **How to use:**
+            1. Upload your PDF file
+            2. Wait for the processing to complete
+            3. Ask questions about the content of your PDF
+        """)
+    
+    pdf_file = st.file_uploader("Upload your PDF", type=['pdf'])
+    
+    if pdf_file is not None:
+        with st.spinner("Processing PDF... This may take a moment."):
+            process_container = st.empty()
+            process_container.info("Creating embeddings for your PDF...")
+            db = process_pdf(pdf_file)
+            process_container.empty()
+            st.success("PDF processed successfully! You can now ask questions.")
+        
+        question = st.text_area("What would you like to know about your PDF?")
+        
+        if st.button("Ask Question"):
+            if question:
+                with st.spinner("Generating answer..."):
+                    answer, metadata = process_answer(question)
+                    
+                    # Display the answer in a nice format
+                    st.markdown("### Answer:")
+                    st.markdown(f">{answer}")  # Better formatting
+                    
+                    # Display source information in a cleaner way
+                    with st.expander("📄 Source Details"):
+                        for i, doc in enumerate(metadata["source_documents"], 1):
+                            st.markdown(f"""
+                                **Source {i}:**
+                                ```
+                                {doc.page_content[:200]}...
+                                ```
+                                **Page:** {doc.metadata.get('page', 'N/A')}
+                                ---
+                            """)
+            else:
+                st.warning("Please enter a question.")
+    else:
+        st.info("👆 Please upload a PDF file to get started!")
 
 if __name__ == '__main__':
     main()
